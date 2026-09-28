@@ -162,7 +162,7 @@ export class MultiSigHandler extends Communicator {
     const assertPublicationCurrent = (
       expectedSecret: TxQueued['secret'] = secret,
       expectedCommitment?: { pub: string; value: PublishedCommitment },
-    ) => {
+    ): undefined => {
       if (
         this.failedContributions.has(transaction) ||
         this.transactions.get(txId) !== transaction ||
@@ -340,6 +340,8 @@ export class MultiSigHandler extends Communicator {
       this.getQueuedTransaction(txId)
         .then(async ({ transaction, release }) => {
           try {
+            if (this.failedContributions.has(transaction))
+              throw new Error('Contribution state changed');
             transaction.tx = tx;
             transaction.boxes = boxes;
             transaction.dataBoxes = dataBoxes ? dataBoxes : [];
@@ -438,7 +440,8 @@ export class MultiSigHandler extends Communicator {
       }
 
       let contribution:
-        ReturnType<MultiSigHandler['captureContribution']> | undefined;
+        | ReturnType<MultiSigHandler['captureContribution']>
+        | undefined;
       if (this.beforeContribution) {
         contribution = this.captureContribution(
           txId,
@@ -483,6 +486,13 @@ export class MultiSigHandler extends Communicator {
             },
             [coordinatorId],
             this.getDate(),
+            contribution
+              ? () =>
+                  contribution.assertPublicationCurrent(generatedSecret, {
+                    pub: myPub,
+                    value: publishCommitments,
+                  })
+              : undefined,
           );
         }
       } else {
@@ -666,6 +676,7 @@ export class MultiSigHandler extends Communicator {
                 signPayload,
                 toSendPeers,
                 this.getDate(),
+                contribution?.assertPublicationCurrent,
               );
             }
           } catch (e) {
@@ -715,7 +726,8 @@ export class MultiSigHandler extends Communicator {
       );
       let outgoingSignPayload: SignPayload | undefined;
       let contribution:
-        ReturnType<MultiSigHandler['captureContribution']> | undefined;
+        | ReturnType<MultiSigHandler['captureContribution']>
+        | undefined;
       try {
         if (transaction.tx === undefined || transaction.secret === undefined) {
           this.logger.info(
@@ -807,6 +819,7 @@ export class MultiSigHandler extends Communicator {
         outgoingSignPayload,
         [sender],
         this.getDate(),
+        contribution?.assertPublicationCurrent,
       );
     } catch (e) {
       this.logger.warn(
@@ -930,7 +943,7 @@ export class MultiSigHandler extends Communicator {
 
     if (!signedTxBytes || !broadcastPayload) return;
 
-    const completed = await this.handleSignedTx(signedTxBytes);
+    const completed = await this.completeSignedTx(signedTxBytes);
     if (!completed) return;
 
     await this.sendMessage(
@@ -946,7 +959,11 @@ export class MultiSigHandler extends Communicator {
    * checks if the transaction is valid and resolve the promise
    * @param txBytes base64 encoded signed transaction
    */
-  handleSignedTx = async (txBytes: string): Promise<boolean> => {
+  handleSignedTx = async (txBytes: string): Promise<void> => {
+    await this.completeSignedTx(txBytes);
+  };
+
+  private completeSignedTx = async (txBytes: string): Promise<boolean> => {
     try {
       const tx = wasm.Transaction.sigma_parse_bytes(
         Uint8Array.from(Buffer.from(txBytes, 'base64')),
@@ -1036,6 +1053,7 @@ export class MultiSigHandler extends Communicator {
         },
         recipients,
         this.getDate(),
+        contribution?.assertPublicationCurrent,
       );
     }
   };

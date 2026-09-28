@@ -677,6 +677,7 @@ describe('MultiSigHandler', () => {
         { txId: reduced.unsigned_tx().id().to_str() },
         [...testPubs].reverse().filter((pk) => pk !== currentTurnId),
         0,
+        undefined,
       );
     });
 
@@ -716,6 +717,7 @@ describe('MultiSigHandler', () => {
         { txId: reduced.unsigned_tx().id().to_str() },
         [...testPubs].reverse().filter((pk) => pk !== currentTurnId),
         0,
+        undefined,
       );
     });
   });
