@@ -11,6 +11,7 @@ import {
   MessageType,
   MultiSigHandler,
   MultiSigUtils,
+  SignPayload,
   TxQueued,
 } from '../lib';
 import { turnTime } from '../lib/const';
@@ -449,6 +450,314 @@ describe('contribution validation', () => {
       );
     },
   );
+
+  it.each(['coordinator-sign', 'peer-sign'] as const)(
+    'does not publish a %s proof when its turn changes during final hint extraction',
+    async (kind) => {
+      const { members, deliver } = await committee(async () => {});
+      const target = members[kind === 'coordinator-sign' ? 0 : 1];
+      let resume!: () => void;
+      const extraction = new Promise<void>((resolve) => (resume = resolve));
+      const entered = Promise.withResolvers<void>();
+      const extract = target.utils.extract_hints.bind(target.utils);
+      if (kind === 'coordinator-sign') {
+        vi.spyOn(target.utils, 'extract_hints')
+          .mockImplementationOnce((...args) => extract(...args))
+          .mockImplementationOnce(async (...args) => {
+            entered.resolve();
+            await extraction;
+            return extract(...args);
+          });
+        const pending = deliver(5);
+        await entered.promise;
+        vi.setSystemTime(turnTime * 1000);
+        resume();
+        await pending;
+        expect(target.send).not.toHaveBeenCalledWith(
+          MessageType.InitiateSign,
+          expect.anything(),
+          expect.anything(),
+          expect.anything(),
+        );
+      } else {
+        await deliver(5);
+        const payload = members[0].send.mock.calls.find(
+          (call) => call[0] === MessageType.InitiateSign,
+        )![1] as InitiateSignPayload;
+        vi.spyOn(target.utils, 'extract_hints').mockImplementationOnce(
+          async (...args) => {
+            entered.resolve();
+            await extraction;
+            return extract(...args);
+          },
+        );
+        const pending = target.handler.initiateSign(testPubs[0], payload, 0);
+        await entered.promise;
+        vi.setSystemTime(turnTime * 1000);
+        resume();
+        await pending;
+        expect(target.send).not.toHaveBeenCalledWith(
+          MessageType.Sign,
+          expect.anything(),
+          expect.anything(),
+          expect.anything(),
+        );
+      }
+      expect(target.reject).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Contribution state changed' }),
+      );
+    },
+  );
+
+  it.each(['coordinator-sign', 'peer-sign'] as const)(
+    'does not publish a %s proof if commitment regeneration replaces its secret during extraction',
+    async (kind) => {
+      const { members, deliver } = await committee(async () => {});
+      const target = members[kind === 'coordinator-sign' ? 0 : 1];
+      let resume!: () => void;
+      const extraction = new Promise<void>((resolve) => (resume = resolve));
+      const entered = Promise.withResolvers<void>();
+      const extract = target.utils.extract_hints.bind(target.utils);
+      if (kind === 'coordinator-sign') {
+        vi.spyOn(target.utils, 'extract_hints')
+          .mockImplementationOnce((...args) => extract(...args))
+          .mockImplementationOnce(async (...args) => {
+            entered.resolve();
+            await extraction;
+            return extract(...args);
+          });
+        const pending = deliver(5);
+        await entered.promise;
+        await target.handler.generateCommitment(txId, 0);
+        resume();
+        await pending;
+        expect(target.send).not.toHaveBeenCalledWith(
+          MessageType.InitiateSign,
+          expect.anything(),
+          expect.anything(),
+          expect.anything(),
+        );
+      } else {
+        await deliver(5);
+        const payload = members[0].send.mock.calls.find(
+          (call) => call[0] === MessageType.InitiateSign,
+        )![1] as InitiateSignPayload;
+        vi.spyOn(target.utils, 'extract_hints').mockImplementationOnce(
+          async (...args) => {
+            entered.resolve();
+            await extraction;
+            return extract(...args);
+          },
+        );
+        const pending = target.handler.initiateSign(testPubs[0], payload, 0);
+        await entered.promise;
+        await target.handler.generateCommitment(txId, 0);
+        resume();
+        await pending;
+        expect(target.send).not.toHaveBeenCalledWith(
+          MessageType.Sign,
+          expect.anything(),
+          expect.anything(),
+          expect.anything(),
+        );
+      }
+      expect(target.reject).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Contribution state changed' }),
+      );
+    },
+  );
+
+  it('does not publish a commitment when the turn changes during peer discovery', async () => {
+    const f = await fixture(async () => {});
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const detection = Reflect.get(
+      f.handler,
+      'guardDetection',
+    ) as GuardDetection;
+    vi.spyOn(detection, 'activeGuards').mockImplementationOnce(async () => {
+      entered.resolve();
+      await resume.promise;
+      return testPubs.map((publicKey, index) => ({
+        publicKey,
+        peerId: publicKey,
+        index,
+      }));
+    });
+    const pending = f.handler.generateCommitment(txId, 0);
+    await entered.promise;
+    vi.setSystemTime(turnTime * 1000);
+    resume.resolve();
+    await expect(pending).rejects.toThrow('Contribution state changed');
+    expect(f.send).not.toHaveBeenCalledWith(
+      MessageType.Commitment,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('does not publish a commitment when its generated secret changes during peer discovery', async () => {
+    const f = await fixture(async () => {});
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    vi.spyOn(f.handler, 'peersWithIds').mockImplementationOnce(async () => {
+      entered.resolve();
+      await resume.promise;
+      return testPubs.map((pub) => ({ pub, id: pub }));
+    });
+    const pending = f.handler.generateCommitment(txId, 0);
+    await entered.promise;
+    const publishedCommitment = f.transaction.commitments[testPubs[0]];
+    f.transaction.secret = wasm.TransactionHintsBag.empty();
+    expect(f.transaction.commitments[testPubs[0]]).toBe(publishedCommitment);
+    resume.resolve();
+    await expect(pending).rejects.toThrow('Contribution state changed');
+    expect(f.send).not.toHaveBeenCalledWith(
+      MessageType.Commitment,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('does not publish InitiateSign when the turn changes during peer discovery', async () => {
+    const { members } = await committee(async () => {});
+    const coordinator = members[0];
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const detection = Reflect.get(
+      coordinator.handler,
+      'guardDetection',
+    ) as GuardDetection;
+    vi.spyOn(detection, 'activeGuards').mockImplementationOnce(async () => {
+      entered.resolve();
+      await resume.promise;
+      return testPubs.map((publicKey, index) => ({
+        publicKey,
+        peerId: publicKey,
+        index,
+      }));
+    });
+    const pending = coordinator.handler.handleCommitment(
+      testPubs[5],
+      { txId, commitment: members[5].transaction.commitments[testPubs[5]] },
+      'test-envelope-verified-upstream',
+      5,
+    );
+    await entered.promise;
+    vi.setSystemTime(turnTime * 1000);
+    resume.resolve();
+    await pending;
+    expect(coordinator.send).not.toHaveBeenCalledWith(
+      MessageType.InitiateSign,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(coordinator.reject).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Contribution state changed' }),
+    );
+  });
+
+  it('does not publish GenerateCommitment when the turn changes during peer discovery', async () => {
+    const f = await fixture(async () => {});
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    vi.spyOn(f.handler, 'peersWithIds').mockImplementationOnce(async () => {
+      entered.resolve();
+      await resume.promise;
+      return testPubs.map((pub) => ({ pub, id: pub }));
+    });
+    const pending = f.handler.handleMyTurnForTx(txId);
+    await entered.promise;
+    vi.setSystemTime(turnTime * 1000);
+    resume.resolve();
+    await expect(pending).rejects.toThrow('Contribution state changed');
+    expect(f.send).not.toHaveBeenCalledWith(
+      MessageType.GenerateCommitment,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('ignores proofs for a queue entry whose contribution authorization failed', async () => {
+    const f = await fixture(async () => {});
+    f.transaction.simulatedBag = wasm.TransactionHintsBag.empty();
+    (Reflect.get(f.handler, 'failedContributions') as WeakSet<TxQueued>).add(
+      f.transaction,
+    );
+
+    await f.handler.handleSign(
+      testPubs[1],
+      { txId, proof: { proof: 'stale' } } as never,
+      1,
+    );
+
+    expect(f.transaction.signs).toEqual({});
+    expect(f.submit).not.toHaveBeenCalled();
+    expect(f.send).not.toHaveBeenCalledWith(
+      MessageType.SignedTx,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('does not resolve or broadcast after authorization fails during final verification', async () => {
+    let refuseCommitments = false;
+    const { members, deliver } = await committee(async (request) => {
+      if (refuseCommitments && request.kind === 'commitment')
+        throw Error('round authorization revoked');
+    });
+    const coordinator = members[0];
+    await deliver(5);
+    const initiatePayload = coordinator.send.mock.calls.find(
+      (call) => call[0] === MessageType.InitiateSign,
+    )![1] as InitiateSignPayload;
+    for (let i = 1; i < members.length; i++)
+      await members[i].handler.initiateSign(testPubs[0], initiatePayload, 0);
+    for (let i = 1; i < members.length - 1; i++) {
+      const payload = members[i].send.mock.calls.find(
+        (call) => call[0] === MessageType.Sign,
+      )![1] as SignPayload;
+      await coordinator.handler.handleSign(testPubs[i], payload, i);
+    }
+
+    const resolved = vi.fn();
+    coordinator.transaction.resolve = resolved;
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    vi.spyOn(coordinator.utils, 'verifyInput').mockImplementationOnce(
+      async () => {
+        entered.resolve();
+        await resume.promise;
+        return true;
+      },
+    );
+    const finalProof = members[5].send.mock.calls.find(
+      (call) => call[0] === MessageType.Sign,
+    )![1] as SignPayload;
+    const pending = coordinator.handler.handleSign(testPubs[5], finalProof, 5);
+    await entered.promise;
+    refuseCommitments = true;
+    await expect(
+      coordinator.handler.generateCommitment(txId, 0),
+    ).rejects.toThrow('round authorization revoked');
+    resume.resolve();
+    await pending;
+
+    expect(resolved).not.toHaveBeenCalled();
+    expect(coordinator.submit).not.toHaveBeenCalled();
+    expect(coordinator.send).not.toHaveBeenCalledWith(
+      MessageType.SignedTx,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(await coordinator.handler.isInSign(txId)).toBe(true);
+  });
 
   it('rejects a round replaced during simulated hint extraction before consulting authorization', async () => {
     const hook = vi.fn(async () => {});

@@ -4,7 +4,7 @@ import { AbstractLogger } from '@rosen-bridge/abstract-logger';
 import { GuardDetection } from '@rosen-bridge/detection';
 import { EncryptionHandler } from '@rosen-bridge/encryption';
 
-import { MultiSigUtils } from './multiSigUtils';
+import { MultiSigUtils } from './multiSigUtils.js';
 
 interface Signer {
   id?: string;
