@@ -12,7 +12,9 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist",
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map",
     "CHANGELOG.md"
   ],
   "scripts": {
@@ -29,7 +31,7 @@
   },
   "dependencies": {
     "@rosen-bridge/abstract-logger": "^4.0.0",
-    "@rosen-bridge/communication": "^3.0.1",
+    "@rosen-bridge/communication": "^3.1.0",
     "@rosen-bridge/detection": "^3.0.1",
     "@rosen-bridge/encryption": "^1.0.1",
     "@rosen-bridge/semaphore": "^0.1.0",

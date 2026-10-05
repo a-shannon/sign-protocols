@@ -109,6 +109,7 @@ export enum MessageType {
 }
 
 interface ErgoMultiSigConfig {
+  signingAuthorization?: SigningAuthorizationConfig;
   logger?: AbstractLogger;
   multiSigUtilsInstance: MultiSigUtils;
   messageEnc: EncryptionHandler;
@@ -120,6 +121,33 @@ interface ErgoMultiSigConfig {
   guardDetection: GuardDetection;
   commGuardsPk: Array<string>;
   ergoGuardPks?: Array<string>;
+}
+
+export interface SigningIdentity {
+  readonly txId: string;
+  readonly reducedTxBytes: string;
+  readonly inputBoxBytes: readonly string[];
+  readonly dataInputBoxBytes: readonly string[];
+  readonly publicKey: string;
+  readonly requiredSign: number;
+  readonly guardPublicKeys: readonly string[];
+}
+
+export type SigningPhase =
+  | 'queue'
+  | 'commitment'
+  | 'sign'
+  | 'outbound'
+  | 'result';
+
+export interface BoundSigningAuthorization {
+  withAction<T>(phase: SigningPhase, action: () => T | Promise<T>): Promise<T>;
+}
+
+export interface SigningAuthorizationConfig {
+  timeoutMs: number;
+  maxPending: number;
+  bind(identity: SigningIdentity): Promise<BoundSigningAuthorization>;
 }
 
 export {

@@ -9,6 +9,10 @@ import packageJson from '../package.json' with { type: 'json' };
 import { turnTime as defaultTurnTime } from './const';
 import { MultiSigUtils } from './multiSigUtils';
 import {
+  SigningAttempt,
+  validateSigningAuthorization,
+} from './signingAuthorization';
+import {
   CommitmentPayload,
   ErgoMultiSigConfig,
   GenerateCommitmentPayload,
@@ -18,6 +22,8 @@ import {
   Signer,
   SignPayload,
   TxQueued,
+  SigningAuthorizationConfig,
+  SigningPhase,
 } from './types';
 
 export class MultiSigHandler extends Communicator {
@@ -37,6 +43,10 @@ export class MultiSigHandler extends Communicator {
   private guardDetection: GuardDetection;
   private publicKey?: string;
   private ergoGuardPks: Array<string>;
+  private readonly signingAuthorization?: SigningAuthorizationConfig;
+  private readonly attempts = new Map<string, SigningAttempt>();
+  private readonly queuedAttempts = new WeakMap<TxQueued, SigningAttempt>();
+  private readonly completedTransactions = new WeakMap<TxQueued, string>();
 
   constructor(config: ErgoMultiSigConfig) {
     super(
@@ -54,6 +64,12 @@ export class MultiSigHandler extends Communicator {
     this.multiSigUtilsInstance = config.multiSigUtilsInstance;
     this.ergoGuardPks = config.ergoGuardPks ?? [];
     this.guardDetection = config.guardDetection;
+    if (config.signingAuthorization) {
+      validateSigningAuthorization(config.signingAuthorization);
+      this.signingAuthorization = Object.freeze({
+        ...config.signingAuthorization,
+      });
+    }
   }
 
   /**
@@ -144,9 +160,12 @@ export class MultiSigHandler extends Communicator {
   getQueuedTransaction = (
     txId: string,
   ): Promise<{ transaction: TxQueued; release: () => void }> => {
+    const expected = this.transactions.get(txId);
     return this.semaphore.acquire().then((release) => {
       try {
         const transaction = this.transactions.get(txId);
+        if (this.signingAuthorization && transaction !== expected)
+          throw new Error('Signing queue changed while waiting');
         if (transaction) return { transaction, release };
         const newTransaction: TxQueued = {
           boxes: [],
@@ -192,6 +211,8 @@ export class MultiSigHandler extends Communicator {
     dataBoxes?: Array<wasm.ErgoBox>,
   ): Promise<wasm.Transaction> => {
     this.peersMustBeInitialized();
+    if (this.signingAuthorization)
+      return this.signAuthorized(tx, requiredSign, boxes, dataBoxes ?? []);
     return new Promise<wasm.Transaction>((resolve, reject) => {
       const txId = tx.unsigned_tx().id().to_str();
       this.getQueuedTransaction(txId)
@@ -218,6 +239,149 @@ export class MultiSigHandler extends Communicator {
         });
     });
   };
+
+  private signAuthorized = (
+    tx: wasm.ReducedTransaction,
+    requiredSign: number,
+    boxes: wasm.ErgoBox[],
+    dataBoxes: wasm.ErgoBox[],
+  ): Promise<wasm.Transaction> => {
+    const config = this.signingAuthorization!;
+    const reducedBytes = tx.sigma_serialize_bytes();
+    const txId = tx.unsigned_tx().id().to_str();
+    if (this.attempts.has(txId) || this.attempts.size >= config.maxPending)
+      return Promise.reject(
+        new Error('Signing attempt already active or capacity exhausted'),
+      );
+    if (
+      !Number.isSafeInteger(requiredSign) ||
+      requiredSign < 1 ||
+      requiredSign > this.ergoGuardPks.length
+    )
+      return Promise.reject(new Error('Invalid required signer count'));
+    const identity = Object.freeze({
+      txId,
+      reducedTxBytes: Buffer.from(reducedBytes).toString('hex'),
+      inputBoxBytes: Object.freeze(
+        boxes.map((box) =>
+          Buffer.from(box.sigma_serialize_bytes()).toString('hex'),
+        ),
+      ),
+      dataInputBoxBytes: Object.freeze(
+        dataBoxes.map((box) =>
+          Buffer.from(box.sigma_serialize_bytes()).toString('hex'),
+        ),
+      ),
+      publicKey: this.getPk(),
+      requiredSign,
+      guardPublicKeys: Object.freeze([...this.ergoGuardPks]),
+    });
+    const cloned = wasm.ReducedTransaction.sigma_parse_bytes(reducedBytes);
+    const cloneBoxes = (values: readonly string[]) =>
+      values.map((bytes) =>
+        wasm.ErgoBox.sigma_parse_bytes(Buffer.from(bytes, 'hex')),
+      );
+    const copiedBoxes = cloneBoxes(identity.inputBoxBytes);
+    const copiedDataBoxes = cloneBoxes(identity.dataInputBoxBytes);
+    return new Promise((resolve, reject) => {
+      let queued: TxQueued | undefined;
+      const attempt: SigningAttempt = new SigningAttempt(
+        identity,
+        config.timeoutMs,
+        () => this.attempts.get(txId) === attempt,
+        (error) => {
+          if (this.attempts.get(txId) === attempt) this.attempts.delete(txId);
+          if (queued && this.transactions.get(txId) === queued)
+            this.transactions.delete(txId);
+          reject(error);
+        },
+      );
+      this.attempts.set(txId, attempt);
+      void (async () => {
+        await attempt.bind(config);
+        const release = await this.semaphore.acquire();
+        try {
+          await attempt.run('queue', () => {
+            queued = {
+              tx: cloned,
+              boxes: copiedBoxes,
+              dataBoxes: copiedDataBoxes,
+              signs: {},
+              commitments: {},
+              commitmentSigns: {},
+              createTime: Date.now(),
+              requiredSigner: requiredSign,
+              coordinator: -1,
+              resolve,
+              reject,
+            };
+            this.queuedAttempts.set(queued, attempt);
+            this.transactions.set(txId, queued);
+          });
+        } finally {
+          release();
+        }
+        attempt.assertActive();
+        await this.handleMyTurnForTx(txId);
+      })().catch((error) => attempt.close(error));
+    });
+  };
+
+  private withWalletAction = async <T>(
+    transaction: TxQueued,
+    phase: SigningPhase,
+    action: () => T,
+    completedBytes?: string,
+  ): Promise<T> => {
+    if (!this.signingAuthorization) return action();
+    const attempt = this.queuedAttempts.get(transaction);
+    if (!attempt) throw new Error('No local signing authorization');
+    return attempt.run(phase, () => {
+      const identity = attempt.identity;
+      if (
+        (this.transactions.get(identity.txId) !== transaction &&
+          (phase !== 'outbound' ||
+            completedBytes === undefined ||
+            this.completedTransactions.get(transaction) !== completedBytes)) ||
+        !transaction.tx ||
+        Buffer.from(transaction.tx.sigma_serialize_bytes()).toString('hex') !==
+          identity.reducedTxBytes ||
+        JSON.stringify(
+          transaction.boxes.map((box) =>
+            Buffer.from(box.sigma_serialize_bytes()).toString('hex'),
+          ),
+        ) !== JSON.stringify(identity.inputBoxBytes) ||
+        JSON.stringify(
+          transaction.dataBoxes.map((box) =>
+            Buffer.from(box.sigma_serialize_bytes()).toString('hex'),
+          ),
+        ) !== JSON.stringify(identity.dataInputBoxBytes) ||
+        transaction.requiredSigner !== identity.requiredSign ||
+        this.getPk() !== identity.publicKey ||
+        JSON.stringify(this.ergoGuardPks) !==
+          JSON.stringify(identity.guardPublicKeys)
+      )
+        throw new Error('Signing attempt identity changed');
+      return action();
+    });
+  };
+
+  private finalDispatch = (
+    transaction: TxQueued,
+    completedBytes?: string,
+  ): [] | [(submit: () => void) => Promise<void>] =>
+    this.signingAuthorization
+      ? [
+          async (submit: () => void): Promise<void> => {
+            await this.withWalletAction(
+              transaction,
+              'outbound',
+              submit,
+              completedBytes,
+            );
+          },
+        ]
+      : [];
 
   /**
    * check if message is in sign
@@ -250,8 +414,15 @@ export class MultiSigHandler extends Communicator {
   generateCommitment = async (
     txId: string,
     coordinatorIndex?: number,
+    expectedTransaction?: TxQueued,
   ): Promise<void> => {
     const transaction = this.transactions.get(txId);
+    if (
+      this.signingAuthorization &&
+      expectedTransaction &&
+      transaction !== expectedTransaction
+    )
+      throw new Error('Signing queue changed before commitment generation');
     if (transaction && transaction.tx) {
       // If this is a request from a coordinator, set them as the coordinator for this tx
       if (coordinatorIndex !== undefined) {
@@ -269,10 +440,14 @@ export class MultiSigHandler extends Communicator {
         transaction.coordinator = currentTurn;
       }
 
-      transaction.secret =
-        this.getProver().generate_commitments_for_reduced_transaction(
-          transaction.tx,
-        );
+      transaction.secret = await this.withWalletAction(
+        transaction,
+        'commitment',
+        () =>
+          this.getProver().generate_commitments_for_reduced_transaction(
+            transaction.tx!,
+          ),
+      );
 
       // publishable commitment
       const myPub = this.getPk();
@@ -299,6 +474,7 @@ export class MultiSigHandler extends Communicator {
             },
             [coordinatorId],
             this.getDate(),
+            ...this.finalDispatch(transaction),
           );
         }
       } else {
@@ -323,6 +499,7 @@ export class MultiSigHandler extends Communicator {
     signature: string,
     index: number,
   ): Promise<void> => {
+    let outgoing: { payload: InitiateSignPayload; peers: string[] } | undefined;
     if (payload.txId) {
       const pub = this.ergoGuardPks[index];
 
@@ -416,9 +593,14 @@ export class MultiSigHandler extends Communicator {
                 );
 
               MultiSigUtils.add_hints(hints, transaction.secret, inputLen);
-              const signedTx = this.getProver().sign_reduced_transaction_multi(
-                transaction.tx,
-                hints,
+              const signedTx = await this.withWalletAction(
+                transaction,
+                'sign',
+                () =>
+                  this.getProver().sign_reduced_transaction_multi(
+                    transaction.tx!,
+                    hints,
+                  ),
               );
 
               const myHint = await this.multiSigUtilsInstance.extract_hints(
@@ -455,12 +637,7 @@ export class MultiSigHandler extends Communicator {
                 `All commitments received for tx [${payload.txId}]. Initiating sign...`,
               );
 
-              await this.sendMessage(
-                MessageType.InitiateSign,
-                signPayload,
-                toSendPeers,
-                this.getDate(),
-              );
+              outgoing = { payload: signPayload, peers: toSendPeers };
             }
           } catch (e) {
             this.logger.warn(
@@ -479,6 +656,14 @@ export class MultiSigHandler extends Communicator {
         );
         release();
       }
+      if (outgoing)
+        await this.sendMessage(
+          MessageType.InitiateSign,
+          outgoing.payload,
+          outgoing.peers,
+          this.getDate(),
+          ...this.finalDispatch(transaction),
+        );
     }
   };
 
@@ -500,6 +685,7 @@ export class MultiSigHandler extends Communicator {
       );
       return;
     }
+    let outgoingTransaction: TxQueued | undefined;
     try {
       const { transaction, release } = await this.getQueuedTransaction(
         payload.txId,
@@ -548,9 +734,11 @@ export class MultiSigHandler extends Communicator {
 
         MultiSigUtils.add_hints(hints, transaction.secret, inputLen);
 
-        const partial = this.getProver().sign_reduced_transaction_multi(
-          transaction.tx,
-          hints,
+        const partial = await this.withWalletAction(transaction, 'sign', () =>
+          this.getProver().sign_reduced_transaction_multi(
+            transaction.tx!,
+            hints,
+          ),
         );
         const signer = [myPub];
         const myHints = await this.multiSigUtilsInstance.extract_hints(
@@ -566,6 +754,7 @@ export class MultiSigHandler extends Communicator {
           proof: proof,
           txId: payload.txId,
         };
+        outgoingTransaction = transaction;
       } finally {
         this.logger.debug(
           `Releasing semaphore after preparing initiate sign response for tx [${payload.txId}]`,
@@ -583,6 +772,7 @@ export class MultiSigHandler extends Communicator {
         outgoingSignPayload,
         [sender],
         this.getDate(),
+        ...(outgoingTransaction ? this.finalDispatch(outgoingTransaction) : []),
       );
     } catch (e) {
       this.logger.warn(
@@ -606,6 +796,7 @@ export class MultiSigHandler extends Communicator {
     let signedTxBytes: string | undefined;
     let broadcastPayload: SignedTxPayload | undefined;
     let recipients: string[] = [];
+    let completedTransaction: TxQueued | undefined;
     try {
       const { transaction, release } = await this.getQueuedTransaction(
         payload.txId,
@@ -673,6 +864,7 @@ export class MultiSigHandler extends Communicator {
           broadcastPayload = {
             txBytes: signedTxBytes,
           };
+          completedTransaction = transaction;
           const myPub = this.getPk();
           recipients = (await this.peersWithIds())
             .filter((peer) => peer.pub !== myPub)
@@ -694,13 +886,16 @@ export class MultiSigHandler extends Communicator {
 
     if (!signedTxBytes || !broadcastPayload) return;
 
-    await this.handleSignedTx(signedTxBytes);
+    await this.handleSignedTx(signedTxBytes, completedTransaction);
 
     await this.sendMessage(
       MessageType.SignedTx,
       broadcastPayload,
       recipients,
       this.getDate(),
+      ...(completedTransaction
+        ? this.finalDispatch(completedTransaction, signedTxBytes)
+        : []),
     );
   };
 
@@ -709,14 +904,21 @@ export class MultiSigHandler extends Communicator {
    * checks if the transaction is valid and resolve the promise
    * @param txBytes base64 encoded signed transaction
    */
-  handleSignedTx = async (txBytes: string): Promise<void> => {
+  handleSignedTx = async (
+    txBytes: string,
+    expectedTransaction?: TxQueued,
+  ): Promise<void> => {
     try {
       const tx = wasm.Transaction.sigma_parse_bytes(
         Uint8Array.from(Buffer.from(txBytes, 'base64')),
       );
       const txId = tx.id().to_str();
+      const expected = expectedTransaction ?? this.transactions.get(txId);
+      if (this.signingAuthorization && !expected) return;
       const { transaction, release } = await this.getQueuedTransaction(txId);
       try {
+        if (this.signingAuthorization && transaction !== expected)
+          throw new Error('Signing queue changed before result verification');
         const isTxValid = await this.multiSigUtilsInstance.verifyInput(
           tx,
           transaction.boxes,
@@ -726,11 +928,24 @@ export class MultiSigHandler extends Communicator {
           `Received signed tx [${txId}] and it is ${isTxValid ? 'valid' : 'invalid'}`,
         );
 
-        if (isTxValid && transaction.resolve) transaction.resolve(tx);
+        if (isTxValid && transaction.resolve) {
+          const admitted = await this.withWalletAction(
+            transaction,
+            'result',
+            () => {
+              this.completedTransactions.set(transaction, txBytes);
+              if (this.transactions.get(txId) === transaction)
+                this.transactions.delete(txId);
+              return tx;
+            },
+          );
+          transaction.resolve(admitted);
+        }
         if (!isTxValid && transaction.reject)
           transaction.reject(`Signed transaction ${txId} is invalid`);
 
-        this.transactions.delete(txId);
+        if (this.transactions.get(txId) === transaction)
+          this.transactions.delete(txId);
       } finally {
         this.logger.debug(
           `Releasing semaphore after validating signed tx [${txId}]`,
@@ -756,12 +971,17 @@ export class MultiSigHandler extends Communicator {
     const myInd = await this.getIndex();
 
     if ((await this.isMyTurn()) && transaction.coordinator !== myInd) {
+      if (
+        this.signingAuthorization &&
+        this.transactions.get(txId) !== transaction
+      )
+        throw new Error('Signing queue changed while awaiting turn');
       this.logger.debug(
         `Initiating sign for tx [${txId}] because it's this guards turn. The correct turn is [${await this.getCurrentTurnId()}]...`,
       );
       this.cleanTxState(transaction);
       transaction.coordinator = myInd;
-      await this.generateCommitment(txId);
+      await this.generateCommitment(txId, undefined, transaction);
       //   ask peers to generate commitment
       const myPub = this.getPk();
       await this.sendMessage(
@@ -776,6 +996,7 @@ export class MultiSigHandler extends Communicator {
             .filter((id): id is string => id !== undefined),
         ),
         this.getDate(),
+        ...this.finalDispatch(transaction),
       );
     }
   };
