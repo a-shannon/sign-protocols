@@ -2,23 +2,17 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 import { EdDSA } from '@rosen-bridge/encryption';
 
-import { TestCommunicator } from './testCommunicator';
+import { payload, protocolVersion } from './testData';
+import { createGuardEncryptions } from './testUtils/communication';
+import { deferred, fixture } from './testUtils/dispatch';
+import { TestCommunicator } from './testUtils/testCommunicator';
 
 describe('Communicator', () => {
-  // must match TestCommunicator's protocolVersion
-  const protocolVersion = '1.0.0';
   let guardMessageEncs: Array<EdDSA>;
   let guardPks: Array<string>;
-  const payload = { foo: 'bar' };
 
   beforeEach(async () => {
-    guardMessageEncs = [];
-    guardPks = [];
-    for (let index = 0; index < 10; index++) {
-      const sk = new EdDSA(await EdDSA.randomKey());
-      guardMessageEncs.push(sk);
-      guardPks.push(await sk.getPk());
-    }
+    ({ guardMessageEncs, guardPks } = await createGuardEncryptions());
   });
 
   describe('getIndex', () => {
@@ -26,7 +20,7 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.getIndex should return exception when pk of guard doesn't exist between guardPks
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - override current guard message encryption with wrong
      * - create communicator
@@ -45,8 +39,8 @@ describe('Communicator', () => {
     });
 
     /**
-     * @target Communicator.getIndex should return correct index 1
-     * @dependencies
+     * @target Communicator.getIndex should return correct index
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - create communicator and assign guardMessageEnc with index 1 as current guard
      * - call getIndex
@@ -76,8 +70,8 @@ describe('Communicator', () => {
     });
 
     /**
-     * @target Communicator.sendMessage should return current timestamp rounded to seconds
-     * @dependencies
+     * @target Communicator.getDate should return current timestamp rounded to seconds
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - mock Date.now to return 1685683305125
      * - call getDate
@@ -107,7 +101,7 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.sendMessage should call submit message
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - mock submitMessage function
      * - call with specified argument
@@ -136,6 +130,255 @@ describe('Communicator', () => {
       const callArgs = JSON.parse(mockSubmit.mock.calls[0][0]);
       expect(callArgs).toEqual(expected);
     });
+
+    /**
+     * @target Communicator.sendMessage checks the gate after asynchronous envelope signing and suppresses a held send
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Pause envelope signing, revoke admission, then release signing
+     * @expected
+     * - Checks the gate after asynchronous envelope signing and suppresses a held send
+     */
+    it('checks the gate after asynchronous envelope signing and suppresses a held send', async () => {
+      const { signer, communicator, submit } = fixture();
+      const waiting = deferred();
+      const entered = deferred();
+      let allowed = true;
+      vi.spyOn(signer, 'sign').mockImplementation(async () => {
+        entered.resolve();
+        await waiting.promise;
+        return 'fixture-signature';
+      });
+      const pending = communicator.send(async (dispatch) => {
+        if (!allowed) throw new Error('held');
+        dispatch();
+      });
+      const result = pending.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await entered.promise;
+      allowed = false;
+      waiting.resolve();
+      expect(await result).toEqual(new Error('held'));
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    /**
+     * @target Communicator.sendMessage checks after the final asynchronous index lookup
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Pause the third public-key lookup, revoke admission, then resume the lookup
+     * @expected
+     * - Checks after the final asynchronous index lookup
+     */
+    it('checks after the final asynchronous index lookup', async () => {
+      const { signer, communicator, submit } = fixture();
+      const waiting = deferred();
+      const entered = deferred();
+      let calls = 0;
+      let allowed = true;
+      vi.spyOn(signer, 'getPk').mockImplementation(async () => {
+        if (++calls === 3) {
+          entered.resolve();
+          await waiting.promise;
+        }
+        return 'fixture-key';
+      });
+      const pending = communicator.send(async (dispatch) => {
+        if (!allowed) throw new Error('held');
+        dispatch();
+      });
+      const result = pending.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await entered.promise;
+      allowed = false;
+      waiting.resolve();
+      expect(await result).toEqual(new Error('held'));
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    /**
+     * @target Communicator.sendMessage releases the gate before waiting for transport completion
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Hold the transport promise after dispatch and inspect the released gate before completing transport
+     * @expected
+     * - Releases the gate before waiting for transport completion
+     */
+    it('releases the gate before waiting for transport completion', async () => {
+      const transport = deferred();
+      const { communicator, submit } = fixture(vi.fn(() => transport.promise));
+      let leased = false;
+      const gateDone = deferred();
+      let finished = false;
+      const pending = communicator
+        .send(async (dispatch) => {
+          leased = true;
+          try {
+            dispatch();
+          } finally {
+            leased = false;
+            gateDone.resolve();
+          }
+        })
+        .then(() => {
+          finished = true;
+        });
+      await gateDone.promise;
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(leased).toEqual(false);
+      expect(finished).toEqual(false);
+      transport.resolve();
+      await pending;
+    });
+
+    /**
+     * @target Communicator.sendMessage propagates transport rejection after the gate ends
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Dispatch a transport promise that rejects after the gate callback returns
+     * @expected
+     * - Propagates transport rejection after the gate ends
+     */
+    it('propagates transport rejection after the gate ends', async () => {
+      const { communicator } = fixture(
+        vi.fn(() => Promise.reject(new Error('transport failed'))),
+      );
+      await expect(
+        communicator.send(async (dispatch) => {
+          dispatch();
+        }),
+      ).rejects.toThrow('transport failed');
+    });
+
+    /**
+     * @target Communicator.sendMessage observes transport rejection while an asynchronous gate is still returning
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Reject transport while the gate return is paused, then resume the gate
+     * @expected
+     * - Observes transport rejection while an asynchronous gate is still returning
+     */
+    it('observes transport rejection while an asynchronous gate is still returning', async () => {
+      const gateReturn = deferred();
+      const entered = deferred();
+      const { communicator } = fixture(
+        vi.fn(() => Promise.reject(new Error('transport failed'))),
+      );
+      const pending = communicator.send(async (dispatch) => {
+        dispatch();
+        entered.resolve();
+        await gateReturn.promise;
+      });
+      const result = pending.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await entered.promise;
+      await new Promise((done) => setTimeout(done, 0));
+      gateReturn.resolve();
+      expect(await result).toEqual(new Error('transport failed'));
+    });
+
+    /**
+     * @target Communicator.sendMessage propagates synchronous submission failure
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Throw from the transport submission callback during authorized dispatch
+     * @expected
+     * - Propagates synchronous submission failure
+     */
+    it('propagates synchronous submission failure', async () => {
+      const { communicator } = fixture(
+        vi.fn(() => {
+          throw new Error('dispatch failed');
+        }),
+      );
+      await expect(
+        communicator.send(async (dispatch) => {
+          dispatch();
+        }),
+      ).rejects.toThrow('dispatch failed');
+    });
+
+    /**
+     * @target Communicator.sendMessage rejects an unused callback and revokes it when the gate returns
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Retain the dispatch callback without invoking it, then invoke it after the gate returns
+     * @expected
+     * - Rejects an unused callback and revokes it when the gate returns
+     */
+    it('rejects an unused callback and revokes it when the gate returns', async () => {
+      const { communicator, submit } = fixture();
+      let saved!: () => void;
+      await expect(
+        communicator.send(async (dispatch) => {
+          saved = dispatch;
+        }),
+      ).rejects.toThrow('not authorized');
+      expect(() => saved()).toThrow('no longer available');
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    /**
+     * @target Communicator.sendMessage revokes the callback when the gate rejects
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Retain the dispatch callback and reject the gate before invoking the retained callback
+     * @expected
+     * - Revokes the callback when the gate rejects
+     */
+    it('revokes the callback when the gate rejects', async () => {
+      const { communicator, submit } = fixture();
+      let saved!: () => void;
+      await expect(
+        communicator.send(async (dispatch) => {
+          saved = dispatch;
+          throw new Error('held');
+        }),
+      ).rejects.toThrow('held');
+      expect(() => saved()).toThrow('no longer available');
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    /**
+     * @target Communicator.sendMessage rejects duplicate callback invocation without dispatching twice
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Invoke the same authorized dispatch callback twice
+     * @expected
+     * - Rejects duplicate callback invocation without dispatching twice
+     */
+    it('rejects duplicate callback invocation without dispatching twice', async () => {
+      const { communicator, submit } = fixture();
+      await expect(
+        communicator.send(async (dispatch) => {
+          dispatch();
+          dispatch();
+        }),
+      ).rejects.toThrow('no longer available');
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * @target Communicator.sendMessage keeps an unconfigured caller independent of transport completion
+     * @dependencies Synthetic encryption, transport and authorization collaborators; actual production handlers
+     * @scenario
+     * - Send without a gate while the transport completion promise remains pending
+     * @expected
+     * - Keeps an unconfigured caller independent of transport completion
+     */
+    it('keeps an unconfigured caller independent of transport completion', async () => {
+      const waiting = deferred();
+      const { communicator, submit } = fixture(vi.fn(() => waiting.promise));
+      await expect(communicator.send()).resolves.toBeUndefined();
+      expect(submit).toHaveBeenCalledTimes(1);
+      waiting.resolve();
+    });
   });
 
   describe('handleMessage', () => {
@@ -152,11 +395,11 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.handleMessage should pass arguments to process message function when sign is valid
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - generate a message signed with second guard sk
      * - pass to handleMessage
-     * @expect
+     * @expected
      * - processMessage function called once
      * - message type and payload pass to processMessage
      */
@@ -190,11 +433,11 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.handleMessage should not call processMessage when signature is not valid
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - generate a message signed with second guard sk with index 3 (invalid sign)
      * - pass to handleMessage
-     * @expect
+     * @expected
      * - processMessage must not call
      */
     it('should not call processMessage when signature is not valid', async () => {
@@ -219,11 +462,11 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.handleMessage should not call processMessage when signer public key differ from index
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - generate a message signed with second guard sk with index 3 and public key of second guard
      * - pass to handleMessage
-     * @expect
+     * @expected
      * - processMessage must not call
      */
     it('should not call processMessage when signer public key differ from index', async () => {
@@ -248,12 +491,12 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.handleMessage should not call processMessage when message timed out
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - mock Date.now() to return 1685683141101
      * - generate a valid message with timestamp equals to 60001 milliseconds before
      * - pass to handleMessage
-     * @expect
+     * @expected
      * - processMessage must not call
      */
     it('should not call processMessage when message timed out', async () => {
@@ -278,11 +521,11 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.handleMessage should not call processMessage when protocol major version differs
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - generate a validly signed message with a different major protocol version
      * - pass to handleMessage
-     * @expect
+     * @expected
      * - processMessage must not call
      */
     it('should not call processMessage when protocol major version differs', async () => {
@@ -308,11 +551,11 @@ describe('Communicator', () => {
 
     /**
      * @target Communicator.handleMessage should call processMessage when only the minor/patch protocol version differs
-     * @dependencies
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - generate a validly signed message whose version shares protocolVersion's major but differs in minor/patch
      * - pass to handleMessage
-     * @expect
+     * @expected
      * - processMessage must be called
      */
     it('should call processMessage when only the minor/patch protocol version differs', async () => {
@@ -337,12 +580,12 @@ describe('Communicator', () => {
     });
 
     /**
-     * @target Communicator.handleMessage should not call processMessage when the version field is tampered after signing
-     * @dependencies
+     * @target Communicator.handleMessage should not call processMessage when the version field is tampered with after signing
+     * @dependencies Real EdDSA and Communicator; synthetic transport observer
      * @scenario
      * - generate a message signed with the current protocol version
      * - rewrite its version field to a different value before passing to handleMessage
-     * @expect
+     * @expected
      * - processMessage must not call, since the signature no longer matches the (signed) version
      */
     it('should not call processMessage when the version field is tampered with after signing', async () => {

@@ -33,6 +33,7 @@ export abstract class Communicator {
    */
   protected getDate = () => Math.floor(Date.now() / 1000);
 
+  /** Configures authenticated peer communication and its message validity window. */
   protected constructor(
     logger: AbstractLogger,
     messageEnc: EncryptionHandler,
@@ -104,6 +105,9 @@ export abstract class Communicator {
    * @param payload
    * @param peers
    * @param timestamp
+   * @param authorizeSubmit optional gate at final dispatch; its synchronous
+   * callback starts submission, while transport completion is awaited outside
+   * the gate. The callback expires when the gate returns and can run only once.
    */
   protected sendMessage = async (
     messageType: string,
@@ -111,6 +115,7 @@ export abstract class Communicator {
     payload: any,
     peers: Array<string>,
     timestamp?: number,
+    authorizeSubmit?: (submit: () => void) => Promise<void>,
   ) => {
     this.logger.debug(
       `sending new message of type ${messageType} with payload ${JSON.stringify(
@@ -129,7 +134,35 @@ export abstract class Communicator {
       index: await this.getIndex(),
       version: this.protocolVersion,
     };
-    this.submitMessage(JSON.stringify(message), peers);
+    const encoded = JSON.stringify(message);
+    if (!authorizeSubmit) {
+      this.submitMessage(encoded, peers);
+      return;
+    }
+
+    let accepting = true;
+    let submitted = false;
+    let completion: Promise<{ error?: unknown; failed: boolean }> | undefined;
+    try {
+      await authorizeSubmit(() => {
+        if (!accepting || submitted)
+          throw new Error('Message dispatch callback is no longer available');
+        submitted = true;
+        // Observe rejection immediately, including when the gate finishes later.
+        completion = Promise.resolve(
+          this.submitMessage(encoded, [...peers]),
+        ).then(
+          () => ({ failed: false }),
+          (error: unknown) => ({ failed: true, error }),
+        );
+      });
+    } finally {
+      accepting = false;
+    }
+    if (!submitted || !completion)
+      throw new Error('Message dispatch was not authorized');
+    const result = await completion;
+    if (result.failed) throw result.error;
   };
 
   /**
