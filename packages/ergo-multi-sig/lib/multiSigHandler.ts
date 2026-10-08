@@ -6,8 +6,8 @@ import { GuardDetection } from '@rosen-bridge/detection';
 import { Semaphore } from '@rosen-bridge/semaphore';
 
 import packageJson from '../package.json' with { type: 'json' };
-import { turnTime as defaultTurnTime } from './const.js';
-import { MultiSigUtils } from './multiSigUtils.js';
+import { turnTime as defaultTurnTime } from './const';
+import { MultiSigUtils } from './multiSigUtils';
 import {
   CommitmentPayload,
   ContributionRequest,
@@ -20,7 +20,7 @@ import {
   Signer,
   SignPayload,
   TxQueued,
-} from './types.js';
+} from './types';
 
 export class MultiSigHandler extends Communicator {
   /** Version of the optional local contribution authorization contract. */
@@ -67,6 +67,10 @@ export class MultiSigHandler extends Communicator {
     this.beforeContribution = config.beforeContribution;
   }
 
+  /**
+   * Permanently refuse this queued attempt, reject its waiter and throw the
+   * authorization error. Non-Error rejections receive a local Error value.
+   */
   private failContribution = (transaction: TxQueued, error: unknown): never => {
     const failure =
       error instanceof Error
@@ -77,12 +81,14 @@ export class MultiSigHandler extends Communicator {
     throw failure;
   };
 
+  /** Capture the current absolute turn and ordered communication/Ergo keys. */
   private contributionContext = () => ({
     turn: Math.floor(Date.now() / this.turnTime),
     communicationKeys: this.guardPks.join(','),
     ergoKeys: this.ergoGuardPks.join(','),
   });
 
+  /** Refuse an attempt whose captured turn or ordered committee has changed. */
   private assertContributionContext = (
     transaction: TxQueued,
     context: ReturnType<MultiSigHandler['contributionContext']>,
@@ -98,8 +104,11 @@ export class MultiSigHandler extends Communicator {
       );
   };
 
-  /** Capture before any hint extraction; the final check runs synchronously
-   * beside the native operation, after authorization's last await. */
+  /**
+   * Capture the request, queue identity, input bytes and signing state before
+   * hint extraction. Returned assertions fence native work and transport
+   * handoff after asynchronous authorization or envelope preparation.
+   */
   private captureContribution = (
     txId: string,
     transaction: TxQueued,
@@ -115,6 +124,7 @@ export class MultiSigHandler extends Communicator {
     const requiredSigner = transaction.requiredSigner;
     const boxes = transaction.boxes;
     const dataBoxes = transaction.dataBoxes;
+    /** Serialize the ordered input boxes, refusing the attempt on failure. */
     const boxBytes = (values: wasm.ErgoBox[]) => {
       try {
         return values
@@ -133,6 +143,7 @@ export class MultiSigHandler extends Communicator {
       kind,
       reducedHex,
     });
+    /** Refuse changed queue, transaction, input or signing-state snapshots. */
     const assertCurrent = () => {
       if (
         this.failedContributions.has(transaction) ||
@@ -156,9 +167,11 @@ export class MultiSigHandler extends Communicator {
         );
       this.assertContributionContext(transaction, context);
     };
-    // A native signature cannot be undone. Keep the request's turn, committee,
-    // transaction and queue identity bound until any async publication lookup
-    // has completed, even after this operation has made its expected local write.
+    /**
+     * Fence transport handoff against the snapshot while allowing this
+     * operation's expected secret and commitment writes. A native signature
+     * cannot be undone after an asynchronous publication lookup.
+     */
     const assertPublicationCurrent = (
       expectedSecret: TxQueued['secret'] = secret,
       expectedCommitment?: { pub: string; value: PublishedCommitment },
@@ -188,6 +201,7 @@ export class MultiSigHandler extends Communicator {
         );
       this.assertContributionContext(transaction, context);
     };
+    /** Check the snapshot and await the configured external authorization. */
     const authorize = async () => {
       assertCurrent();
       try {
@@ -417,6 +431,11 @@ export class MultiSigHandler extends Communicator {
     }
   };
 
+  /**
+   * Generate one commitment for a queued transaction and coordinator. When
+   * configured, authorize before native work and recheck before publication.
+   * The public wrapper owns coalescing concurrent requests for this operation.
+   */
   private generateCommitmentOnce = async (
     txId: string,
     coordinatorIndex?: number,
@@ -963,6 +982,12 @@ export class MultiSigHandler extends Communicator {
     await this.completeSignedTx(txBytes);
   };
 
+  /**
+   * Verify signed transaction bytes against the queued inputs. Settle and
+   * remove a current, non-refused entry; return false for invalid bytes,
+   * verification errors, replaced entries or previously refused attempts.
+   * The public completion callback retains its Promise<void> contract.
+   */
   private completeSignedTx = async (txBytes: string): Promise<boolean> => {
     try {
       const tx = wasm.Transaction.sigma_parse_bytes(

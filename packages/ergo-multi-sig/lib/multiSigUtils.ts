@@ -1,13 +1,13 @@
 import * as wasm from 'ergo-lib-wasm-nodejs';
 import { ErgoBox, ErgoBoxes, TransactionHintsBag } from 'ergo-lib-wasm-nodejs';
 
-import { CHALLENGE_LEN } from './const.js';
+import { CHALLENGE_LEN } from './const';
 import {
   CommitmentJson,
   PublishedCommitment,
   PublishedProof,
   SingleCommitment,
-} from './types.js';
+} from './types';
 
 export class MultiSigUtils {
   getStateContext: () => Promise<wasm.ErgoStateContext>;
